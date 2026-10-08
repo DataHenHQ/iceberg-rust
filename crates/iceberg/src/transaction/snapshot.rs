@@ -36,6 +36,11 @@ use crate::table::Table;
 use crate::transaction::ActionCommit;
 use crate::{Error, ErrorKind, TableRequirement, TableUpdate};
 
+/// stack: #2543 (RewriteManifests) calls this as a free function; it delegates to the producer's own.
+pub(crate) fn generate_unique_snapshot_id(table: &Table) -> i64 {
+    SnapshotProducer::generate_unique_snapshot_id(table)
+}
+
 /// A trait that defines how different table operations produce new snapshots.
 ///
 /// `SnapshotProduceOperation` is used by [`SnapshotProducer`] to customize snapshot creation
@@ -136,7 +141,7 @@ impl<'a> SnapshotProducer<'a> {
     ) -> Self {
         Self {
             table,
-            snapshot_id: Self::generate_unique_snapshot_id(table),
+            snapshot_id: generate_unique_snapshot_id(table),
             commit_uuid,
             snapshot_properties,
             // Collapsed to the first file per path, so a manifest never references a file twice.

@@ -59,6 +59,7 @@ mod manage_snapshots;
 mod overwrite;
 mod merging;
 mod rewrite;
+mod rewrite_manifests;
 mod snapshot;
 mod sort_order;
 mod unreferenced_files;
@@ -84,6 +85,7 @@ pub use crate::transaction::expire_snapshots::ExpireSnapshotsAction;
 pub use crate::transaction::manage_snapshots::ManageSnapshotsAction;
 pub use crate::transaction::overwrite::OverwriteAction;
 pub use crate::transaction::rewrite::RewriteFilesAction;
+pub use crate::transaction::rewrite_manifests::RewriteManifestsAction;
 pub use crate::transaction::sort_order::ReplaceSortOrderAction;
 pub use crate::transaction::update_location::UpdateLocationAction;
 pub use crate::transaction::update_properties::UpdatePropertiesAction;
@@ -197,6 +199,11 @@ impl Transaction {
     /// Manage snapshot references (branches and tags) like Java `ManageSnapshots`.
     pub fn manage_snapshots(&self) -> ManageSnapshotsAction {
         ManageSnapshotsAction::new()
+    }
+
+    /// Creates a rewrite manifests action (manifest consolidation), like Java `RewriteManifests`.
+    pub fn rewrite_manifests(&self) -> RewriteManifestsAction {
+        RewriteManifestsAction::new()
     }
 
     /// Commit transaction.
