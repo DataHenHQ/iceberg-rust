@@ -461,7 +461,7 @@ mod tests {
         let total_entries: usize = {
             let mut n = 0;
             for m in post_list.entries() {
-                let manifest = m.load_manifest(table.file_io()).await.unwrap();
+                let manifest = table.manifest_reader().read(m).await.unwrap();
                 n += manifest.entries().len();
             }
             n
@@ -470,7 +470,7 @@ mod tests {
 
         let mut seen_seqs: Vec<i64> = Vec::new();
         for m in post_list.entries() {
-            let manifest = m.load_manifest(table.file_io()).await.unwrap();
+            let manifest = table.manifest_reader().read(m).await.unwrap();
             for entry in manifest.entries() {
                 seen_seqs.push(entry.sequence_number().unwrap());
             }
@@ -554,7 +554,7 @@ mod tests {
 
         let mut total = 0;
         for m in post_list.entries() {
-            let manifest = m.load_manifest(t.file_io()).await.unwrap();
+            let manifest = t.manifest_reader().read(m).await.unwrap();
             let n = manifest.entries().len();
             assert!(
                 n <= 2,
@@ -613,8 +613,9 @@ mod tests {
 
         let mut total = 0;
         for m in post_list.entries() {
-            total += m
-                .load_manifest(table.file_io())
+            total += table
+                .manifest_reader()
+                .read(m)
                 .await
                 .unwrap()
                 .entries()
@@ -639,7 +640,7 @@ mod tests {
                 .unwrap();
             let mut v = Vec::new();
             for m in list.entries() {
-                let manifest = m.load_manifest(t.file_io()).await.unwrap();
+                let manifest = t.manifest_reader().read(m).await.unwrap();
                 for entry in manifest.entries() {
                     v.push((
                         entry.data_file().file_path().to_string(),
@@ -791,7 +792,7 @@ mod tests {
         let post_list = table.manifest_list_reader(snap).load().await.unwrap();
         assert_eq!(post_list.entries().len(), 2);
         for m in post_list.entries() {
-            let manifest = m.load_manifest(table.file_io()).await.unwrap();
+            let manifest = table.manifest_reader().read(m).await.unwrap();
             let partitions: std::collections::HashSet<Struct> = manifest
                 .entries()
                 .iter()
