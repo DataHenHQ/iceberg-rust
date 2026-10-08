@@ -336,6 +336,9 @@ impl MergingSnapshotProducer {
             self.commit_uuid,
             HashMap::new(),
             self.added_data_files.clone(),
+            // stack fix: #3253 gave SnapshotProducer its own removed-file list; the merging producer of #3046
+            // accounts for removed files itself, so none are handed down (two mechanisms for one job).
+            Vec::new(),
         );
         snapshot_producer.validate_added_data_files()?;
         snapshot_producer.validate_duplicate_files().await?;

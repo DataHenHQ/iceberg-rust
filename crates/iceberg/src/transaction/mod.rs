@@ -159,6 +159,8 @@ impl Transaction {
     /// Creates an overwrite action.
     pub fn overwrite(&self) -> OverwriteAction {
         OverwriteAction::new()
+    }
+
     /// Creates a rewrite files action for compaction.
     ///
     /// This action replaces a set of data files with a new set while keeping
