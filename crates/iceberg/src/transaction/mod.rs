@@ -55,6 +55,7 @@ mod action;
 pub use action::*;
 mod append;
 mod expire_snapshots;
+mod manage_snapshots;
 mod overwrite;
 mod merging;
 mod rewrite;
@@ -80,6 +81,7 @@ use crate::table::Table;
 use crate::transaction::action::BoxedTransactionAction;
 pub use crate::transaction::append::FastAppendAction;
 pub use crate::transaction::expire_snapshots::ExpireSnapshotsAction;
+pub use crate::transaction::manage_snapshots::ManageSnapshotsAction;
 pub use crate::transaction::overwrite::OverwriteAction;
 pub use crate::transaction::rewrite::RewriteFilesAction;
 pub use crate::transaction::sort_order::ReplaceSortOrderAction;
@@ -190,6 +192,11 @@ impl Transaction {
     /// Expire snapshots from the table metadata.
     pub fn expire_snapshots(&self) -> ExpireSnapshotsAction {
         ExpireSnapshotsAction::new()
+    }
+
+    /// Manage snapshot references (branches and tags) like Java `ManageSnapshots`.
+    pub fn manage_snapshots(&self) -> ManageSnapshotsAction {
+        ManageSnapshotsAction::new()
     }
 
     /// Commit transaction.
