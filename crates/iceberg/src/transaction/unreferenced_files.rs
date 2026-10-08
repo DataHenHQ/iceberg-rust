@@ -101,7 +101,7 @@ pub async fn unreferenced_files(
     let metadata = table.metadata();
 
     // gc.enabled=false forbids deleting any file, so there is nothing to report (see the fn docs).
-    if !metadata.table_properties()?.gc_enabled() {
+    if !metadata.table_properties().gc_enabled()? {
         return Ok(UnreferencedFiles {
             manifest_lists: HashSet::new(),
             manifests: HashSet::new(),
