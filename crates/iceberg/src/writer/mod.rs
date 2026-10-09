@@ -385,6 +385,7 @@
 //! ```
 
 pub mod base_writer;
+pub mod deletion_vector;
 pub mod file_writer;
 pub mod partitioning;
 
