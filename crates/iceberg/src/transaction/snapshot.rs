@@ -15,6 +15,8 @@
 // specific language governing permissions and limitations
 // under the License.
 
+// Modified by DataHen (see DATAHEN_FORK.md): added delete files: with_added_delete_files, validate_added_delete_files, write_added_delete_manifest, and their use in produce_manifests and summary.
+
 use std::collections::{HashMap, HashSet};
 use std::future::Future;
 use std::sync::atomic::{AtomicU64, Ordering};

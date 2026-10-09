@@ -15,6 +15,8 @@
 // specific language governing permissions and limitations
 // under the License.
 
+// Modified by DataHen (see DATAHEN_FORK.md): the deletion_vector module declaration.
+
 //! Iceberg writer module.
 //!
 //! This module contains the generic writer trait and specific writer implementation. We categorize the writer into two types:

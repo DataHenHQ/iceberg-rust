@@ -15,6 +15,8 @@
 // specific language governing permissions and limitations
 // under the License.
 
+// Modified by DataHen (see DATAHEN_FORK.md): Transaction::with_exact_base, do_commit_exact, row_delta(), replace_files() and their tests.
+
 //! This module contains transaction api.
 //!
 //! The transaction API enables changes to be made to an existing table.
