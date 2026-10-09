@@ -127,6 +127,8 @@ pub(crate) struct SnapshotProducer<'a> {
     snapshot_properties: HashMap<String, String>,
     added_data_files: Vec<DataFile>,
     deleted_data_files: Vec<DataFile>,
+    // Delete files (position deletes, deletion vectors, equality deletes) this commit adds.
+    added_delete_files: Vec<DataFile>,
     // Numbers this commit's manifest files. Atomic so `new_manifest_writer` can take `&self`.
     manifest_counter: AtomicU64,
 }
@@ -153,8 +155,60 @@ impl<'a> SnapshotProducer<'a> {
                 .into_iter()
                 .unique_by(|f| f.file_path.clone())
                 .collect(),
+            added_delete_files: Vec::new(),
             manifest_counter: AtomicU64::new(0),
         }
+    }
+
+    /// Adds delete files to this commit. They are written to a delete manifest of their own.
+    pub(crate) fn with_added_delete_files(mut self, delete_files: Vec<DataFile>) -> Self {
+        self.added_delete_files = delete_files;
+        self
+    }
+
+    /// Delete files need format version 2 or later, must not be data content, and must be
+    /// written under the table's default partition spec.
+    pub(crate) fn validate_added_delete_files(&self) -> Result<()> {
+        if !self.added_delete_files.is_empty()
+            && self.table.metadata().format_version() == FormatVersion::V1
+        {
+            return Err(invalid_data!(
+                "Delete files are not supported by format version 1"
+            ));
+        }
+        for delete_file in &self.added_delete_files {
+            if delete_file.content_type() == crate::spec::DataContentType::Data {
+                return Err(invalid_data!(
+                    "Only delete content is allowed in added delete files, but {} is data",
+                    delete_file.file_path
+                ));
+            }
+            if self.table.metadata().default_partition_spec_id() != delete_file.partition_spec_id {
+                return Err(invalid_data!(
+                    "Delete file partition spec id does not match table default partition spec id"
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    // Write the manifest for added delete files.
+    async fn write_added_delete_manifest(&mut self) -> Result<ManifestFile> {
+        let added_delete_files = std::mem::take(&mut self.added_delete_files);
+        let mut writer = self.new_manifest_writer(
+            ManifestContentType::Deletes,
+            self.table.metadata().current_schema().clone(),
+            self.table.metadata().default_partition_spec().clone(),
+        )?;
+        for delete_file in added_delete_files {
+            writer.add_entry(
+                ManifestEntry::builder()
+                    .status(crate::spec::ManifestStatus::Added)
+                    .data_file(delete_file)
+                    .build(),
+            )?;
+        }
+        writer.write_manifest_file().await
     }
 
     pub(crate) fn validate_added_data_files(&self) -> Result<()> {
@@ -372,6 +426,7 @@ impl<'a> SnapshotProducer<'a> {
         // For details, please refer to https://github.com/apache/iceberg-rust/issues/1548
         if self.added_data_files.is_empty()
             && self.deleted_data_files.is_empty()
+            && self.added_delete_files.is_empty()
             && self.snapshot_properties.is_empty()
         {
             return Err(Error::new(
@@ -387,6 +442,10 @@ impl<'a> SnapshotProducer<'a> {
         if !self.added_data_files.is_empty() {
             let added_manifest = self.write_added_manifest().await?;
             manifest_files.push(added_manifest);
+        }
+        if !self.added_delete_files.is_empty() {
+            let added_delete_manifest = self.write_added_delete_manifest().await?;
+            manifest_files.push(added_delete_manifest);
         }
 
         // # TODO
@@ -437,6 +496,14 @@ impl<'a> SnapshotProducer<'a> {
                 data_file,
                 table_metadata.current_schema().clone(),
                 partition_spec.clone(),
+            );
+        }
+
+        for delete_file in &self.added_delete_files {
+            summary_collector.add_file(
+                delete_file,
+                table_metadata.current_schema().clone(),
+                table_metadata.default_partition_spec().clone(),
             );
         }
 
