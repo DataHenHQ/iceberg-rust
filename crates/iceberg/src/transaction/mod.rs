@@ -101,6 +101,7 @@ use crate::{Catalog, TableCommit, TableRequirement, TableUpdate};
 pub struct Transaction {
     table: Table,
     actions: Vec<BoxedTransactionAction>,
+    exact_base: bool,
 }
 
 impl Transaction {
@@ -109,7 +110,19 @@ impl Transaction {
         Self {
             table: table.clone(),
             actions: vec![],
+            exact_base: false,
         }
+    }
+
+    /// Commit against exactly the table state this transaction was created from.
+    ///
+    /// By default [`Transaction::commit`] reloads the table and, if it has moved, re-applies the
+    /// actions to the newer state. With an exact base the table is not reloaded and the actions
+    /// are never re-applied: the commit carries a requirement that the `main` branch still
+    /// points at the base snapshot, and it fails with a non-retryable error if it does not.
+    pub fn with_exact_base(mut self) -> Self {
+        self.exact_base = true;
+        self
     }
 
     fn update_table_metadata(table: Table, updates: &[TableUpdate]) -> Result<Table> {
@@ -227,6 +240,10 @@ impl Transaction {
             return Ok(self.table);
         }
 
+        if self.exact_base {
+            return self.do_commit_exact(catalog).await;
+        }
+
         let table_props = self.table.metadata().table_properties();
 
         let backoff = Self::build_backoff(table_props)?;
@@ -254,6 +271,43 @@ impl Transaction {
             .with_max_times(props.commit_num_retries()?)
             .with_factor(2.0)
             .build())
+    }
+
+    /// One attempt, against the base this transaction was created from. No reload, no re-apply.
+    async fn do_commit_exact(&self, catalog: &dyn Catalog) -> Result<Table> {
+        let mut current_table = self.table.clone();
+        let mut updates: Vec<TableUpdate> = vec![];
+        let mut requirements: Vec<TableRequirement> = vec![];
+        for action in &self.actions {
+            let action_commit = Arc::clone(action).commit(&current_table).await?;
+            current_table = Self::apply(
+                current_table,
+                action_commit,
+                &mut updates,
+                &mut requirements,
+            )?;
+        }
+        // Whatever the actions asked for, the base itself is asserted.
+        let base = TableRequirement::RefSnapshotIdMatch {
+            r#ref: crate::spec::MAIN_BRANCH.to_string(),
+            snapshot_id: self.table.metadata().current_snapshot_id(),
+        };
+        if !requirements.contains(&base) {
+            requirements.push(base);
+        }
+        let table_commit = TableCommit::builder()
+            .ident(self.table.identifier().to_owned())
+            .updates(updates)
+            .requirements(requirements)
+            .build();
+        catalog.update_table(table_commit).await.map_err(|e| {
+            // A moved base is a definite answer, never something to retry onto a newer snapshot.
+            if e.retryable() {
+                e.with_retryable(false)
+            } else {
+                e
+            }
+        })
     }
 
     async fn do_commit(&mut self, catalog: &dyn Catalog) -> Result<Table> {
@@ -723,6 +777,189 @@ mod tests {
             Some("test.value")
         );
         assert!(updated_table.encryption_manager().is_some());
+    }
+
+    // ---- exact-base commit ----
+
+    async fn append_one(catalog: &impl Catalog, table: &Table, path: &str) -> Result<Table, Error> {
+        let tx = Transaction::new(table);
+        let tx = tx
+            .fast_append()
+            .add_data_files(vec![make_data_file(table, path, 1, 100)])
+            .apply(tx)
+            .unwrap();
+        tx.commit(catalog).await
+    }
+
+    #[tokio::test]
+    async fn test_exact_base_commit_fails_when_the_base_has_moved() {
+        let catalog = new_memory_catalog().await;
+        let table = make_v2_minimal_table_in_catalog(&catalog).await;
+        let s100 = append_one(&catalog, &table, "d/base.parquet")
+            .await
+            .unwrap();
+
+        // a candidate is prepared against S100 and not yet committed
+        let candidate = Transaction::new(&s100).with_exact_base();
+        let candidate = candidate
+            .fast_append()
+            .add_data_files(vec![make_data_file(&s100, "d/candidate.parquet", 1, 100)])
+            .apply(candidate)
+            .unwrap();
+
+        // another writer advances the table to S101
+        let s101 = append_one(&catalog, &s100, "d/other.parquet")
+            .await
+            .unwrap();
+        let s101_id = s101.metadata().current_snapshot_id();
+
+        let err = candidate
+            .commit(&catalog)
+            .await
+            .err()
+            .expect("a stale base must fail");
+        assert_eq!(err.kind(), ErrorKind::CatalogCommitConflicts);
+        assert!(
+            !err.retryable(),
+            "a moved base is a definite answer, not something to retry"
+        );
+
+        // nothing was applied: the head is still S101
+        let now = catalog.load_table(s101.identifier()).await.unwrap();
+        assert_eq!(now.metadata().current_snapshot_id(), s101_id);
+    }
+
+    #[tokio::test]
+    async fn test_default_commit_reapplies_a_stale_transaction_to_the_new_head() {
+        // The behaviour `with_exact_base` exists to prevent — with retries switched off as well,
+        // because the reload happens before the first attempt.
+        let catalog = new_memory_catalog().await;
+        let table = make_v2_minimal_table_in_catalog(&catalog).await;
+        let tx = Transaction::new(&table);
+        let tx = tx
+            .update_table_properties()
+            .set(
+                TableProperties::PROPERTY_COMMIT_NUM_RETRIES.to_string(),
+                "0".to_string(),
+            )
+            .apply(tx)
+            .unwrap();
+        let table = tx.commit(&catalog).await.unwrap();
+        let s100 = append_one(&catalog, &table, "d/base.parquet")
+            .await
+            .unwrap();
+
+        let candidate = Transaction::new(&s100);
+        let candidate = candidate
+            .fast_append()
+            .add_data_files(vec![make_data_file(&s100, "d/candidate.parquet", 1, 100)])
+            .apply(candidate)
+            .unwrap();
+        let s101 = append_one(&catalog, &s100, "d/other.parquet")
+            .await
+            .unwrap();
+
+        let committed = candidate.commit(&catalog).await.unwrap();
+        assert_eq!(
+            committed
+                .metadata()
+                .current_snapshot()
+                .unwrap()
+                .parent_snapshot_id(),
+            s101.metadata().current_snapshot_id(),
+            "the candidate built on S100 was applied on top of S101"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_exact_base_commit_succeeds_when_the_base_has_not_moved() {
+        let catalog = new_memory_catalog().await;
+        let table = make_v2_minimal_table_in_catalog(&catalog).await;
+        let s100 = append_one(&catalog, &table, "d/base.parquet")
+            .await
+            .unwrap();
+
+        let tx = Transaction::new(&s100).with_exact_base();
+        let tx = tx
+            .fast_append()
+            .add_data_files(vec![make_data_file(&s100, "d/next.parquet", 1, 100)])
+            .apply(tx)
+            .unwrap();
+        let committed = tx.commit(&catalog).await.unwrap();
+        assert_eq!(
+            committed
+                .metadata()
+                .current_snapshot()
+                .unwrap()
+                .parent_snapshot_id(),
+            s100.metadata().current_snapshot_id()
+        );
+    }
+
+    #[tokio::test]
+    async fn test_exact_base_commit_neither_reloads_nor_retries() {
+        // The table allows three retries; an exact-base commit makes one attempt, never reloads the
+        // table, and hands a retryable catalog error back as non-retryable.
+        let table = setup_test_table("3");
+        let mut mock_catalog = MockCatalog::new();
+        mock_catalog.expect_load_table().times(0);
+        mock_catalog
+            .expect_update_table()
+            .times(1)
+            .returning_st(|_| {
+                Box::pin(async move {
+                    Err(
+                        Error::new(ErrorKind::CatalogCommitConflicts, "Commit conflict")
+                            .with_retryable(true),
+                    )
+                })
+            });
+
+        let tx = Transaction::new(&table).with_exact_base();
+        let tx = tx
+            .update_table_properties()
+            .set("test.key".to_string(), "test.value".to_string())
+            .apply(tx)
+            .unwrap();
+        let err = tx.commit(&mock_catalog).await.err().unwrap();
+        assert_eq!(err.kind(), ErrorKind::CatalogCommitConflicts);
+        assert!(!err.retryable());
+    }
+
+    #[tokio::test]
+    async fn test_exact_base_commit_asserts_the_base_snapshot_for_every_action() {
+        // A metadata-only action asks for nothing about the branch head; the exact base adds it.
+        let table = make_v2_table();
+        let base = table.metadata().current_snapshot_id();
+        let mut mock_catalog = MockCatalog::new();
+        mock_catalog.expect_load_table().times(0);
+        mock_catalog
+            .expect_update_table()
+            .times(1)
+            .returning_st(move |mut commit| {
+                let asserted = commit.take_requirements().iter().any(|r| {
+                    matches!(r, crate::TableRequirement::RefSnapshotIdMatch { r#ref, snapshot_id }
+                    if r#ref == crate::spec::MAIN_BRANCH && *snapshot_id == base)
+                });
+                Box::pin(async move {
+                    if asserted {
+                        Ok(make_v2_table())
+                    } else {
+                        Err(Error::new(
+                            ErrorKind::Unexpected,
+                            "the base was not asserted",
+                        ))
+                    }
+                })
+            });
+
+        let tx = Transaction::new(&table).with_exact_base();
+        let tx = tx
+            .update_table_properties()
+            .set("test.key".to_string(), "test.value".to_string())
+            .apply(tx)
+            .unwrap();
+        tx.commit(&mock_catalog).await.unwrap();
     }
 }
 
