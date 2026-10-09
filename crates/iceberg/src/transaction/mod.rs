@@ -56,10 +56,11 @@ pub use action::*;
 mod append;
 mod expire_snapshots;
 mod manage_snapshots;
-mod overwrite;
 mod merging;
+mod overwrite;
 mod rewrite;
 mod rewrite_manifests;
+mod row_delta;
 mod snapshot;
 mod sort_order;
 mod unreferenced_files;
@@ -86,6 +87,7 @@ pub use crate::transaction::manage_snapshots::ManageSnapshotsAction;
 pub use crate::transaction::overwrite::OverwriteAction;
 pub use crate::transaction::rewrite::RewriteFilesAction;
 pub use crate::transaction::rewrite_manifests::RewriteManifestsAction;
+pub use crate::transaction::row_delta::RowDeltaAction;
 pub use crate::transaction::sort_order::ReplaceSortOrderAction;
 pub use crate::transaction::update_location::UpdateLocationAction;
 pub use crate::transaction::update_properties::UpdatePropertiesAction;
@@ -204,6 +206,18 @@ impl Transaction {
     /// Creates a rewrite manifests action (manifest consolidation), like Java `RewriteManifests`.
     pub fn rewrite_manifests(&self) -> RewriteManifestsAction {
         RewriteManifestsAction::new()
+    }
+
+    /// Creates a row-delta action: adds data files and delete files (position deletes or
+    /// deletion vectors) and removes delete files they replace, in one snapshot.
+    pub fn row_delta(&self) -> RowDeltaAction {
+        RowDeltaAction::new()
+    }
+
+    /// Creates a replace of data files and the delete files that applied to them, in one
+    /// snapshot — a compaction that materialises row-level deletes.
+    pub fn replace_files(&self) -> RowDeltaAction {
+        RowDeltaAction::new_replace()
     }
 
     /// Commit transaction.
