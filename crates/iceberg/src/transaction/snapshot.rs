@@ -426,7 +426,13 @@ impl<'a> SnapshotProducer<'a> {
         // TODO: Allowing snapshot property setup with no added data files is a workaround.
         // We should clean it up after all necessary actions are supported.
         // For details, please refer to https://github.com/apache/iceberg-rust/issues/1548
-        if self.added_data_files.is_empty()
+        //
+        // An append is the exception: a zero-file append is a valid commit that produces a
+        // snapshot holding exactly what its parent held (nothing, on a new table). The Java
+        // reference commits one the same way — `table.newAppend().commit()` — and it is how a
+        // table is given an initial snapshot without writing any data.
+        if snapshot_produce_operation.operation() != Operation::Append
+            && self.added_data_files.is_empty()
             && self.deleted_data_files.is_empty()
             && self.added_delete_files.is_empty()
             && self.snapshot_properties.is_empty()

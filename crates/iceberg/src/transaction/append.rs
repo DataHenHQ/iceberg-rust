@@ -469,12 +469,99 @@ mod tests {
         );
     }
 
+    /// A zero-file append is a valid commit: it produces a snapshot of operation `append`
+    /// that adds nothing, carries no property of its own, and — on a table with no snapshot —
+    /// has no parent and an empty manifest list.
     #[tokio::test]
     async fn test_empty_data_append_action() {
         let table = make_v2_minimal_table();
+        assert!(table.metadata().current_snapshot().is_none());
         let tx = Transaction::new(&table);
         let action = tx.fast_append().add_data_files(vec![]);
-        assert!(Arc::new(action).commit(&table).await.is_err());
+        let mut action_commit = Arc::new(action).commit(&table).await.unwrap();
+        let updates = action_commit.take_updates();
+
+        let TableUpdate::AddSnapshot { snapshot } = &updates[0] else {
+            unreachable!()
+        };
+        assert_eq!(snapshot.summary().operation, crate::spec::Operation::Append);
+        assert_eq!(snapshot.parent_snapshot_id(), None);
+        let summary = &snapshot.summary().additional_properties;
+        assert!(!summary.contains_key("added-data-files"), "{summary:?}");
+        assert!(!summary.contains_key("added-records"), "{summary:?}");
+        for total in ["total-data-files", "total-records", "total-delete-files"] {
+            assert_eq!(
+                summary.get(total).map(String::as_str),
+                Some("0"),
+                "{summary:?}"
+            );
+        }
+
+        // The manifest list exists and is empty: no manifest was written for nothing.
+        let manifest_list = table
+            .manifest_list_reader(&Arc::new(snapshot.clone()))
+            .load()
+            .await
+            .unwrap();
+        assert!(manifest_list.entries().is_empty());
+
+        // `main` is set to the new snapshot, as for any append.
+        assert_eq!(updates[1], TableUpdate::SetSnapshotRef {
+            ref_name: MAIN_BRANCH.to_string(),
+            reference: crate::spec::SnapshotReference::new(
+                snapshot.snapshot_id(),
+                crate::spec::SnapshotRetention::branch(None, None, None)
+            ),
+        });
+    }
+
+    /// A zero-file append on a table that already holds data changes nothing it holds: the new
+    /// snapshot references exactly the parent's manifests.
+    #[tokio::test]
+    async fn test_empty_append_after_data_keeps_the_parents_manifests() {
+        let table = make_v2_minimal_table();
+        let data_file = DataFileBuilder::default()
+            .content(DataContentType::Data)
+            .file_path("test/1.parquet".to_string())
+            .file_format(DataFileFormat::Parquet)
+            .file_size_in_bytes(100)
+            .record_count(7)
+            .partition_spec_id(table.metadata().default_partition_spec_id())
+            .partition(Struct::from_iter([Some(Literal::long(300))]))
+            .build()
+            .unwrap();
+        let tx = Transaction::new(&table);
+        let action = tx.fast_append().add_data_files(vec![data_file]);
+        let mut first = Arc::new(action).commit(&table).await.unwrap();
+        let mut builder = table.metadata().clone().into_builder(None);
+        for update in first.take_updates() {
+            builder = update.apply(builder).unwrap();
+        }
+        let table = table.with_metadata(Arc::new(builder.build().unwrap().metadata));
+        let parent = table.metadata().current_snapshot().unwrap().clone();
+        let parent_manifests = table.manifest_list_reader(&parent).load().await.unwrap();
+
+        let tx = Transaction::new(&table);
+        let action = tx.fast_append().add_data_files(vec![]);
+        let mut second = Arc::new(action).commit(&table).await.unwrap();
+        let updates = second.take_updates();
+        let TableUpdate::AddSnapshot { snapshot } = &updates[0] else {
+            unreachable!()
+        };
+        assert_eq!(snapshot.parent_snapshot_id(), Some(parent.snapshot_id()));
+        assert_eq!(snapshot.summary().operation, crate::spec::Operation::Append);
+        let summary = &snapshot.summary().additional_properties;
+        assert_eq!(summary.get("total-records").map(String::as_str), Some("7"));
+        assert_eq!(
+            summary.get("total-data-files").map(String::as_str),
+            Some("1")
+        );
+        let manifests = table
+            .manifest_list_reader(&Arc::new(snapshot.clone()))
+            .load()
+            .await
+            .unwrap();
+        assert_eq!(manifests.entries(), parent_manifests.entries());
     }
 
     /// A `fast_append` must write the manifest list and the manifest
