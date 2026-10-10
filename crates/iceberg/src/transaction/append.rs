@@ -105,6 +105,10 @@ impl SnapshotProduceOperation for FastAppendOperation {
         Operation::Append
     }
 
+    fn allows_empty_commit(&self) -> bool {
+        true
+    }
+
     async fn delete_entries(
         &self,
         _snapshot_produce: &SnapshotProducer<'_>,

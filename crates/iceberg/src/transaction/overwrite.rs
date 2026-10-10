@@ -260,6 +260,87 @@ mod tests {
         entries
     }
 
+    /// An overwrite with nothing to add and nothing to delete is refused. It is not given the
+    /// append action's licence to commit an empty snapshot: this action would record such a
+    /// commit as `append`, where the Java reference records an empty `newOverwrite().commit()`
+    /// as `overwrite` — so there is no equivalent behaviour to offer, and none is offered.
+    #[tokio::test]
+    async fn test_empty_overwrite_is_refused() {
+        let catalog = new_memory_catalog().await;
+        let table = make_v3_minimal_table_in_catalog(&catalog).await;
+        let action = Transaction::new(&table).overwrite();
+        let error = Arc::new(action).commit(&table).await.err().unwrap();
+        assert_eq!(error.kind(), ErrorKind::PreconditionFailed);
+
+        // The same after the table holds data: an overwrite that names no file changes nothing
+        // and commits nothing.
+        let spec_id = table.metadata().default_partition_spec_id();
+        let tx = Transaction::new(&table);
+        let action = tx
+            .fast_append()
+            .add_data_files(vec![test_data_file("test/a.parquet", spec_id)]);
+        let table = action.apply(tx).unwrap().commit(&catalog).await.unwrap();
+        let head = table.metadata().current_snapshot_id();
+        let tx = Transaction::new(&table);
+        let action = tx.overwrite();
+        let error = action
+            .apply(tx)
+            .unwrap()
+            .commit(&catalog)
+            .await
+            .err()
+            .unwrap();
+        assert_eq!(error.kind(), ErrorKind::PreconditionFailed);
+        use crate::Catalog;
+        let reloaded = catalog.load_table(table.identifier()).await.unwrap();
+        assert_eq!(reloaded.metadata().current_snapshot_id(), head);
+        assert_eq!(reloaded.metadata().snapshots().count(), 1);
+    }
+
+    /// What an overwrite that does have something to do records is unchanged: adding and
+    /// deleting is `overwrite`, deleting alone is `delete`, adding alone is `append`.
+    #[tokio::test]
+    async fn test_non_empty_overwrite_operations_are_unchanged() {
+        let catalog = new_memory_catalog().await;
+        let table = make_v3_minimal_table_in_catalog(&catalog).await;
+        let spec_id = table.metadata().default_partition_spec_id();
+        let (a, b, c) = (
+            test_data_file("test/a.parquet", spec_id),
+            test_data_file("test/b.parquet", spec_id),
+            test_data_file("test/c.parquet", spec_id),
+        );
+
+        let tx = Transaction::new(&table);
+        let action = tx.overwrite().add_data_files(vec![a.clone(), b.clone()]);
+        let table = action.apply(tx).unwrap().commit(&catalog).await.unwrap();
+        let snapshot = table.metadata().current_snapshot().unwrap();
+        assert_eq!(snapshot.summary().operation, Operation::Append);
+
+        let tx = Transaction::new(&table);
+        let action = tx
+            .overwrite()
+            .add_data_files(vec![c.clone()])
+            .delete_data_files(vec![a.clone()]);
+        let table = action.apply(tx).unwrap().commit(&catalog).await.unwrap();
+        let snapshot = table.metadata().current_snapshot().unwrap();
+        assert_eq!(snapshot.summary().operation, Operation::Overwrite);
+
+        let tx = Transaction::new(&table);
+        let action = tx.overwrite().delete_data_files(vec![b.clone()]);
+        let table = action.apply(tx).unwrap().commit(&catalog).await.unwrap();
+        let snapshot = table.metadata().current_snapshot().unwrap();
+        assert_eq!(snapshot.summary().operation, Operation::Delete);
+
+        let live: Vec<String> = current_manifest_entries(&table)
+            .await
+            .into_iter()
+            .filter(|(status, _)| *status != ManifestStatus::Deleted)
+            .map(|(_, path)| path)
+            .collect();
+        assert_eq!(live, vec!["test/c.parquet".to_string()]);
+        assert_eq!(table.metadata().snapshots().count(), 3);
+    }
+
     #[tokio::test]
     async fn test_overwrite_with_deleted_files() {
         let catalog = new_memory_catalog().await;

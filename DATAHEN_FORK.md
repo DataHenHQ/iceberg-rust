@@ -39,7 +39,7 @@ Written by DataHen (commits prefixed `datahen(carry):`):
 | deletion-vector file writer and reader | `crates/iceberg/src/writer/deletion_vector.rs` (new), `crates/iceberg/src/writer/mod.rs` (modified) |
 | `RowDeltaAction`, `Transaction::replace_files()` | `crates/iceberg/src/transaction/row_delta.rs` (new), `crates/iceberg/src/transaction/mod.rs` (modified) |
 | exact-base commit, `Transaction::with_exact_base()` | `crates/iceberg/src/transaction/mod.rs` (modified) |
-| zero-file append: `fast_append()` with no files commits a snapshot, as `table.newAppend().commit()` does in the Java reference | `crates/iceberg/src/transaction/snapshot.rs` (modified), `crates/iceberg/src/transaction/append.rs` (tests) |
+| zero-file append: `fast_append()` with no files commits a snapshot, as `table.newAppend().commit()` does in the Java reference; no other action may commit with nothing to do | `crates/iceberg/src/transaction/snapshot.rs`, `crates/iceberg/src/transaction/append.rs` (modified; tests), `crates/iceberg/src/transaction/overwrite.rs` (tests) |
 
 Files modified by DataHen carry a `// Modified by DataHen` line under their licence header; files written by
 DataHen carry a DataHen copyright header. Upstream-PR files modified here only to resolve conflicts or follow an

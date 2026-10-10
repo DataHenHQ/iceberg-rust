@@ -75,6 +75,14 @@ pub(crate) trait SnapshotProduceOperation: Send + Sync {
     /// which is stored in the snapshot metadata for tracking and auditing purposes.
     fn operation(&self) -> Operation;
 
+    /// Whether this operation may commit when it adds no file, removes no file and sets no
+    /// snapshot property. Only an append may: a zero-file append is a valid commit that
+    /// produces a snapshot holding exactly what its parent held, as `table.newAppend().commit()`
+    /// does in the Java reference. Every other operation is refused when it has nothing to do.
+    fn allows_empty_commit(&self) -> bool {
+        false
+    }
+
     /// Returns manifest entries that should be marked as deleted in the new snapshot.
     #[allow(unused)]
     fn delete_entries(
@@ -427,11 +435,13 @@ impl<'a> SnapshotProducer<'a> {
         // We should clean it up after all necessary actions are supported.
         // For details, please refer to https://github.com/apache/iceberg-rust/issues/1548
         //
-        // An append is the exception: a zero-file append is a valid commit that produces a
-        // snapshot holding exactly what its parent held (nothing, on a new table). The Java
-        // reference commits one the same way — `table.newAppend().commit()` — and it is how a
-        // table is given an initial snapshot without writing any data.
-        if snapshot_produce_operation.operation() != Operation::Append
+        // An append is the exception (`allows_empty_commit`): a zero-file append is a valid
+        // commit that produces a snapshot holding exactly what its parent held (nothing, on a
+        // new table). The Java reference commits one the same way — `table.newAppend().commit()`
+        // — and it is how a table is given an initial snapshot without writing any data. The
+        // exception is the append action's own, not that of any operation that happens to be
+        // recorded as `append`.
+        if !snapshot_produce_operation.allows_empty_commit()
             && self.added_data_files.is_empty()
             && self.deleted_data_files.is_empty()
             && self.added_delete_files.is_empty()
