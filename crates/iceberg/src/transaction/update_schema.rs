@@ -15,6 +15,9 @@
 // specific language governing permissions and limitations
 // under the License.
 
+// Modified by DataHen (see DATAHEN_FORK.md): added make_column_optional — the counterpart of Java Iceberg's
+// UpdateSchema.makeColumnOptional — and its use in the rebuild of the schema tree.
+
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
@@ -115,6 +118,7 @@ impl AddColumn {
 pub struct UpdateSchemaAction {
     additions: Vec<AddColumn>,
     deletes: Vec<String>,
+    optionals: Vec<String>,
 }
 
 impl UpdateSchemaAction {
@@ -123,6 +127,7 @@ impl UpdateSchemaAction {
         Self {
             additions: Vec::new(),
             deletes: Vec::new(),
+            optionals: Vec::new(),
         }
     }
 
@@ -145,6 +150,16 @@ impl UpdateSchemaAction {
     /// At commit time, the column must exist in the current schema.
     pub fn delete_column(mut self, name: impl ToString) -> Self {
         self.deletes.push(name.to_string());
+        self
+    }
+
+    /// Record that an existing column becomes optional (Java: `UpdateSchema.makeColumnOptional`).
+    ///
+    /// The field keeps its id, name and type; only `required` changes. A nested field is named by its full
+    /// path (`"person.age"`). At commit time the column must exist, must not be an identifier field and must
+    /// not be a map key; a column already optional is left as it is.
+    pub fn make_column_optional(mut self, name: impl ToString) -> Self {
+        self.optionals.push(name.to_string());
         self
     }
 }
@@ -262,12 +277,13 @@ fn rebuild_fields(
     fields: &[NestedFieldRef],
     adds: &HashMap<Option<i32>, Vec<NestedFieldRef>>,
     delete_ids: &HashSet<i32>,
+    optional_ids: &HashSet<i32>,
     parent_id: Option<i32>,
 ) -> Vec<NestedFieldRef> {
     fields
         .iter()
         .filter(|f| !delete_ids.contains(&f.id))
-        .map(|f| rebuild_field(f, adds, delete_ids))
+        .map(|f| rebuild_field(f, adds, delete_ids, optional_ids))
         .chain(adds.get(&parent_id).into_iter().flatten().cloned())
         .collect()
 }
@@ -279,15 +295,22 @@ fn rebuild_field(
     field: &NestedFieldRef,
     adds: &HashMap<Option<i32>, Vec<NestedFieldRef>>,
     delete_ids: &HashSet<i32>,
+    optional_ids: &HashSet<i32>,
 ) -> NestedFieldRef {
+    let required = field.required && !optional_ids.contains(&field.id);
     match field.field_type.as_ref() {
-        Type::Primitive(_) | Type::Variant(_) => field.clone(),
+        Type::Primitive(_) | Type::Variant(_) if required == field.required => field.clone(),
+        Type::Primitive(_) | Type::Variant(_) => Arc::new(NestedField {
+            required,
+            ..field.as_ref().clone()
+        }),
         Type::Struct(s) => {
-            let new_fields = rebuild_fields(s.fields(), adds, delete_ids, Some(field.id));
+            let new_fields =
+                rebuild_fields(s.fields(), adds, delete_ids, optional_ids, Some(field.id));
             Arc::new(NestedField {
                 id: field.id,
                 name: field.name.clone(),
-                required: field.required,
+                required,
                 field_type: Box::new(Type::Struct(StructType::new(new_fields))),
                 doc: field.doc.clone(),
                 initial_default: field.initial_default.clone(),
@@ -295,11 +318,11 @@ fn rebuild_field(
             })
         }
         Type::List(l) => {
-            let new_element = rebuild_field(&l.element_field, adds, delete_ids);
+            let new_element = rebuild_field(&l.element_field, adds, delete_ids, optional_ids);
             Arc::new(NestedField {
                 id: field.id,
                 name: field.name.clone(),
-                required: field.required,
+                required,
                 field_type: Box::new(Type::List(ListType {
                     element_field: new_element,
                 })),
@@ -309,12 +332,12 @@ fn rebuild_field(
             })
         }
         Type::Map(m) => {
-            let new_key = rebuild_field(&m.key_field, adds, delete_ids);
-            let new_value = rebuild_field(&m.value_field, adds, delete_ids);
+            let new_key = rebuild_field(&m.key_field, adds, delete_ids, optional_ids);
+            let new_value = rebuild_field(&m.value_field, adds, delete_ids, optional_ids);
             Arc::new(NestedField {
                 id: field.id,
                 name: field.name.clone(),
-                required: field.required,
+                required,
                 field_type: Box::new(Type::Map(MapType {
                     key_field: new_key,
                     value_field: new_value,
@@ -362,6 +385,47 @@ impl TransactionAction for UpdateSchemaAction {
                             None => Ok(field.id),
                         }
                     })
+            })
+            .collect::<Result<HashSet<i32>>>()?;
+
+        // --- 1b. Validate the columns made optional ---
+        let map_key_ids: HashSet<i32> = base_schema
+            .field_id_to_fields()
+            .values()
+            .filter_map(|field| match field.field_type.as_ref() {
+                Type::Map(map) => Some(map.key_field.id),
+                _ => None,
+            })
+            .collect();
+        let optional_ids = self
+            .optionals
+            .iter()
+            .map(|name| {
+                let field = base_schema.field_by_name(name).ok_or_else(|| {
+                    Error::new(
+                        ErrorKind::PreconditionFailed,
+                        format!("Cannot make missing column optional: {name}"),
+                    )
+                })?;
+                if delete_ids.contains(&field.id) {
+                    return Err(Error::new(
+                        ErrorKind::PreconditionFailed,
+                        format!("Cannot make a deleted column optional: {name}"),
+                    ));
+                }
+                if base_schema.identifier_field_ids().any(|id| id == field.id) {
+                    return Err(Error::new(
+                        ErrorKind::PreconditionFailed,
+                        format!("Cannot make identifier field optional: {name}"),
+                    ));
+                }
+                if map_key_ids.contains(&field.id) {
+                    return Err(Error::new(
+                        ErrorKind::PreconditionFailed,
+                        format!("Cannot make a map key optional: {name}"),
+                    ));
+                }
+                Ok(field.id)
             })
             .collect::<Result<HashSet<i32>>>()?;
 
@@ -448,6 +512,7 @@ impl TransactionAction for UpdateSchemaAction {
             base_schema.as_struct().fields(),
             &additions_by_parent,
             &delete_ids,
+            &optional_ids,
             None,
         );
 
@@ -472,21 +537,22 @@ impl TransactionAction for UpdateSchemaAction {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::HashMap;
     use std::io::BufReader;
     use std::sync::Arc;
 
     use as_any::Downcast;
 
     use crate::spec::{
-        DEFAULT_SCHEMA_ID, Literal, NestedField, PrimitiveType, StructType, TableMetadata, Type,
-        VariantType,
+        DEFAULT_SCHEMA_ID, Literal, NestedField, PrimitiveType, Schema, StructType, TableMetadata,
+        Type, VariantType,
     };
     use crate::table::Table;
     use crate::transaction::Transaction;
     use crate::transaction::action::{ApplyTransactionAction, TransactionAction};
     use crate::transaction::tests::make_v2_table;
     use crate::transaction::update_schema::{AddColumn, DEFAULT_FIELD_ID, UpdateSchemaAction};
-    use crate::{ErrorKind, TableIdent, TableRequirement, TableUpdate};
+    use crate::{ErrorKind, Result, TableIdent, TableRequirement, TableUpdate};
 
     // The V2 test table has:
     //   last_column_id: 3
@@ -606,6 +672,201 @@ mod tests {
         assert_eq!(assigned.id, 11);
         assert_eq!(*assigned.field_type, Type::Variant(VariantType));
         assert_eq!(next_id, 11);
+    }
+
+    // --- make_column_optional (DataHen) ---
+
+    async fn committed_schema(table: &Table, action: UpdateSchemaAction) -> Result<Schema> {
+        let mut commit = Arc::new(action).commit(table).await?;
+        match commit.take_updates().into_iter().next() {
+            Some(TableUpdate::AddSchema { schema }) => Ok(schema),
+            other => panic!("expected AddSchema, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_make_column_optional_keeps_id_name_and_type() {
+        let table = make_v2_table();
+        let before = table
+            .metadata()
+            .current_schema()
+            .field_by_id(3)
+            .unwrap()
+            .clone();
+        assert!(before.required);
+        let tx = Transaction::new(&table);
+        let schema = committed_schema(&table, tx.update_schema().make_column_optional("z"))
+            .await
+            .unwrap();
+        let after = schema.field_by_id(3).unwrap();
+        assert_eq!(
+            (after.id, &after.name, &after.field_type),
+            (before.id, &before.name, &before.field_type)
+        );
+        assert!(!after.required);
+        // Every other field is untouched, and no field id is assigned.
+        assert_eq!(
+            schema.field_by_id(1),
+            table.metadata().current_schema().field_by_id(1)
+        );
+        assert_eq!(
+            schema.highest_field_id(),
+            table.metadata().current_schema().highest_field_id()
+        );
+        // The commit is bound to the exact schema it was built on.
+        let mut commit = Arc::new(
+            Transaction::new(&table)
+                .update_schema()
+                .make_column_optional("z"),
+        )
+        .commit(&table)
+        .await
+        .unwrap();
+        assert_eq!(commit.take_requirements(), vec![
+            TableRequirement::CurrentSchemaIdMatch {
+                current_schema_id: table.metadata().current_schema().schema_id()
+            }
+        ]);
+    }
+
+    #[tokio::test]
+    async fn test_make_column_optional_with_an_addition_in_one_schema() {
+        let table = make_v2_table();
+        let tx = Transaction::new(&table);
+        let action = tx
+            .update_schema()
+            .make_column_optional("z")
+            .add_column(AddColumn::optional(
+                "w",
+                Type::Primitive(PrimitiveType::String),
+            ));
+        let schema = committed_schema(&table, action).await.unwrap();
+        assert!(!schema.field_by_id(3).unwrap().required);
+        assert_eq!(schema.field_by_name("w").unwrap().id, 4);
+    }
+
+    #[tokio::test]
+    async fn test_make_column_optional_on_an_optional_column_is_a_no_op() {
+        let table = make_v2_table_with_nested();
+        let tx = Transaction::new(&table);
+        let schema = committed_schema(&table, tx.update_schema().make_column_optional("person"))
+            .await
+            .unwrap();
+        assert_eq!(
+            schema.as_struct(),
+            table.metadata().current_schema().as_struct()
+        );
+    }
+
+    #[tokio::test]
+    async fn test_make_column_optional_nested_struct_and_list_fields() {
+        let table = make_v2_table_with_nested();
+        let tx = Transaction::new(&table);
+        let action = tx
+            .update_schema()
+            .make_column_optional("person.age")
+            .make_column_optional("tags.element");
+        let schema = committed_schema(&table, action).await.unwrap();
+        assert!(!schema.field_by_id(6).unwrap().required);
+        assert!(!schema.field_by_id(8).unwrap().required);
+        // Siblings and parents are as they were.
+        assert_eq!(
+            schema.field_by_id(5),
+            table.metadata().current_schema().field_by_id(5)
+        );
+        assert!(!schema.field_by_id(4).unwrap().required);
+    }
+
+    #[tokio::test]
+    async fn test_make_column_optional_refusals() {
+        let table = make_v2_table_with_nested();
+        for (name, why) in [
+            ("missing", "missing column"),
+            ("x", "identifier field"),
+            ("props.key", "map key"),
+        ] {
+            let tx = Transaction::new(&table);
+            let refused = committed_schema(&table, tx.update_schema().make_column_optional(name))
+                .await
+                .unwrap_err();
+            assert_eq!(refused.kind(), ErrorKind::PreconditionFailed, "{name}");
+            assert!(refused.to_string().contains(why), "{name}: {refused}");
+        }
+        let tx = Transaction::new(&table);
+        let refused = committed_schema(
+            &table,
+            tx.update_schema()
+                .delete_column("z")
+                .make_column_optional("z"),
+        )
+        .await
+        .unwrap_err();
+        assert!(refused.to_string().contains("deleted column"));
+    }
+
+    #[tokio::test]
+    async fn test_make_column_optional_commits_through_a_catalog() {
+        use crate::memory::{MEMORY_CATALOG_WAREHOUSE, MemoryCatalogBuilder};
+        use crate::{Catalog, CatalogBuilder, NamespaceIdent, TableCreation};
+        let warehouse = tempfile::TempDir::new().unwrap();
+        let catalog = MemoryCatalogBuilder::default()
+            .load(
+                "memory",
+                HashMap::from([(
+                    MEMORY_CATALOG_WAREHOUSE.to_string(),
+                    warehouse.path().to_str().unwrap().to_string(),
+                )]),
+            )
+            .await
+            .unwrap();
+        let namespace = NamespaceIdent::new("ns".to_string());
+        catalog
+            .create_namespace(&namespace, HashMap::new())
+            .await
+            .unwrap();
+        let schema = Schema::builder()
+            .with_fields(vec![
+                NestedField::required(1, "id", Type::Primitive(PrimitiveType::Long)).into(),
+                NestedField::required(2, "surface", Type::Primitive(PrimitiveType::String)).into(),
+            ])
+            .build()
+            .unwrap();
+        let table = catalog
+            .create_table(
+                &namespace,
+                TableCreation::builder()
+                    .name("t".to_string())
+                    .schema(schema)
+                    .build(),
+            )
+            .await
+            .unwrap();
+        let original = table.clone();
+        let tx = Transaction::new(&table);
+        let tx = tx
+            .update_schema()
+            .make_column_optional("surface")
+            .add_column(AddColumn::optional(
+                "rule",
+                Type::Primitive(PrimitiveType::String),
+            ))
+            .apply(tx)
+            .unwrap();
+        let table = tx.commit(&catalog).await.unwrap();
+        let current = table.metadata().current_schema();
+        let surface = current.field_by_name("surface").unwrap();
+        assert_eq!((surface.id, surface.required), (2, false));
+        assert_eq!(current.field_by_name("rule").unwrap().id, 3);
+        // The earlier schema is kept, as every schema change keeps it: snapshots written under it read it.
+        assert_eq!(table.metadata().schemas_iter().count(), 2);
+        // A commit built on the earlier schema is refused: the schema it asserted is no longer current.
+        let old = Transaction::new(&original).with_exact_base();
+        let tx = old
+            .update_schema()
+            .make_column_optional("id")
+            .apply(old)
+            .unwrap();
+        let _ = tx.commit(&catalog).await.unwrap_err();
     }
 
     #[tokio::test]
